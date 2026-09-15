@@ -56,6 +56,24 @@ turms is a **development-time tool only**: the generated code depends on Pydanti
 
 ## Installation
 
+> **This fork is not the PyPI release.** `turms` on PyPI is upstream `2.0.2` and
+> does **not** contain the additions documented below (the schema-fidelity fixes
+> and `secured_permissions`). Install this fork instead — the `merge` extra is
+> what `MergeProcessor` needs to preserve your resolver bodies:
+>
+> ```bash
+> uv add --dev "turms[merge] @ git+https://github.com/andreribeiro87/turms@main"
+> uv run turms gen
+> ```
+>
+> Or run it without installing:
+>
+> ```bash
+> uvx --from "turms[merge] @ git+https://github.com/andreribeiro87/turms@main" turms gen
+> ```
+>
+> Pin a commit instead of `main` for reproducible builds, e.g. `@177e508`.
+
 Because turms is a development-time tool that never becomes a runtime dependency, the easiest way to use it is to not install it at all and run it with [uvx](https://docs.astral.sh/uv/guides/tools/):
 
 ```bash
