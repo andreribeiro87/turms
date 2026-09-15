@@ -44,6 +44,8 @@ turms is a **development-time tool only**: the generated code depends on Pydanti
 - **Fully typed, fully documented** code generation — GraphQL descriptions become docstrings, deprecations become warnings
 - **Client-side generation** from documents: enums, inputs, fragments and operations as Pydantic v2 models
 - **Server-side generation** from SDL schemas: typed [Strawberry](https://strawberry.rocks/) scaffolds with resolver stubs
+- **Schema fidelity** — the generated Strawberry schema matches the SDL it came from: unions keep their names, `ID` stays `ID`, and directives survive on input fields
+- **Authorization directives** — `@secured`-style directives become enforced [Strawberry permissions](https://strawberry.rocks/docs/guides/permissions), not just schema metadata
 - **Operation functions** — call `get_capsules()` instead of assembling query strings (sync and async, via the funcs plugin)
 - **Transport agnostic** — works with [rath](https://github.com/jhnnsrs/rath), [gql](https://github.com/graphql-python/gql), or any HTTP client you like
 - **Extensible pipeline** — plugins, parsers, stylers, and processors are all swappable and configurable
@@ -190,7 +192,7 @@ Plugins generate the actual code. Enable them per project; order matters (enums 
 | `turms.plugins.fragments.FragmentsPlugin` | Pydantic models for GraphQL fragments |
 | `turms.plugins.operations.OperationsPlugin` | One Pydantic model per query/mutation/subscription, with nested `Arguments` and `Meta` (the exact document) |
 | `turms.plugins.funcs.FuncsPlugin` | Typed, documented call functions per operation (sync + async) that delegate to your client through configurable proxies |
-| `turms.plugins.strawberry.StrawberryPlugin` | A Strawberry server schema with typed resolver stubs |
+| `turms.plugins.strawberry.StrawberryPlugin` | A Strawberry server schema with typed resolver stubs, and enforcement for `@secured`-style authorization directives |
 
 The funcs plugin turns operations into plain function calls. With an executor proxy configured (see [`examples/rath-usage`](examples/rath-usage)):
 
@@ -391,6 +393,89 @@ class Query:
 ```
 
 With the `MergeProcessor` enabled you can evolve the schema and regenerate freely: your resolver implementations survive.
+
+### Keeping the served schema faithful to the SDL
+
+A migrated or generated server has to serve the same schema its clients generated
+their types from, so the plugin preserves what the SDL declares:
+
+- **Unions keep their names.** A union is emitted as
+  `Annotated[Union[A, B], strawberry.union("ClientDocument")]`. Without that,
+  strawberry names an unnamed union after its members, so
+  `union ClientDocument = Invoice | Receipt` would be served as
+  `ClientDocumentInvoiceReceipt` and stop matching the schema.
+- **`ID` stays `ID`.** The shared scalar map resolves `ID` to `str` for the
+  pydantic plugins, which have no ID equivalent. Applied to a server schema, that
+  silently rewrote every `ID` into `String`. An explicit `scalar_definitions`
+  entry still wins over the plugin's default.
+- **Directives survive on input fields**, so an authorization directive declared
+  on an input type is not quietly dropped from the served schema.
+
+### Enforcing authorization directives
+
+A schema directive is metadata: strawberry prints `@secured(requires: "...")`
+into the schema and never acts on it. `secured_permissions` maps each `requires`
+expression to a permission, and matching fields are generated with a
+`PermissionExtension` — so the rule is checked at resolve time, the resolver never
+runs when it fails, and the printed schema keeps the original directive.
+
+```yaml
+plugins:
+  - type: turms.plugins.strawberry.StrawberryPlugin
+    secured_permissions:
+      "@authService.hasRole(#authentication, 'ADMIN')": "myapp.permissions.admin_only"
+      "@authService.isAuthenticated(#authentication)": "myapp.permissions.authenticated"
+      "@authService.isAdminOrOwner(#authentication, #id)": "myapp.permissions.admin_or_owner"
+```
+
+Values are dotted paths resolved like every other user-code reference in turms:
+the module is imported and the final name is used.
+
+```python
+# myapp/permissions.py
+from strawberry.permission import BasePermission
+
+
+class AdminOnly(BasePermission):
+    message = "errors.unauthorizedAccess"
+    error_extensions = {"errorType": "UNAUTHORIZED_ACCESS"}
+
+    def has_permission(self, source, info, **kwargs):
+        return "ADMIN" in (info.context.get("roles") or [])
+
+
+admin_only = AdminOnly()
+```
+
+```python
+@strawberry.type
+class User:
+    key_invoice_api_key: str | None = strawberry.field(
+        directives=[secured(requires="@authService.hasRole(#authentication, 'ADMIN')")],
+        extensions=[PermissionExtension(permissions=[admin_only], use_directives=False)],
+    )
+```
+
+Root (`Query`/`Mutation`) fields carry the same two keywords on the decorator.
+Field arguments reach the permission, so `#id` in
+`isAdminOrOwner(#authentication, #id)` is the field's own `id` argument. Set
+`error_extensions` to keep whatever error shape your clients already handle.
+
+Once `secured_permissions` is configured, a rule turms cannot make true is a
+generation error instead of a field that advertises protection nothing checks:
+
+- a `requires` expression with no mapping;
+- a `@secured` in a location a permission cannot reach — an input field, an
+  argument, or an object type. List the location in `secured_unenforced_locations`
+  to accept it staying unenforced.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `secured_directive` | `"secured"` | Directive name to read the rules from |
+| `secured_permissions` | `{}` | `requires` expression → dotted path of a permission instance |
+| `secured_unenforced_locations` | `[]` | Locations accepted as declared-but-unenforced |
+
+Unconfigured, the plugin's output is unchanged.
 
 ## CLI
 
