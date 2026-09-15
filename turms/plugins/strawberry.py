@@ -25,8 +25,9 @@ from pydantic_settings import SettingsConfigDict
 
 from turms.plugins.base import Plugin, PluginConfig, rename_deprecated_keys
 import ast
-from typing import Any, Dict, List, Protocol, runtime_checkable
+from typing import Any, Callable, Dict, List, Optional, Protocol, runtime_checkable
 from turms.config import GeneratorConfig, ImportableFunctionMixin
+from turms.errors import GenerationError
 from graphql.utilities.build_client_schema import GraphQLSchema
 from pydantic import Field, model_validator
 from graphql.type.definition import (
@@ -370,6 +371,32 @@ class StrawberryPluginConfig(PluginConfig):
         "oneOf",
     ]
     builtin_scalars: List[str] = ["String", "Boolean", "DateTime", "Int", "Float", "ID"]
+    # The shared scalar map resolves GraphQL `ID` to `str`, which is correct for
+    # the pydantic plugins (they have no ID equivalent) but degrades a Strawberry
+    # schema to `String`. The Strawberry plugin therefore resolves scalars itself.
+    # An explicit `scalar_definitions` entry still wins over these defaults.
+    scalar_overrides: Dict[str, str] = {"ID": "strawberry.ID"}
+    # Enforcement for `@secured(requires: "...")` directives.
+    #
+    # Maps each `requires` expression to the dotted path of a strawberry
+    # permission instance, for example:
+    #   {"@authService.hasRole(#authentication, 'ADMIN')": "vissoma.permissions.admin_only"}
+    # Fields carrying a mapped directive get
+    # `extensions=[PermissionExtension(permissions=[admin_only])]`, so the rule is
+    # checked at resolve time and the resolver never runs when it fails.
+    #
+    # The plugin keeps emitting the directive itself, so the printed schema still
+    # carries `@secured(requires: ...)` and the contract with generated clients is
+    # unchanged.
+    #
+    # Once set, a `@secured` the plugin cannot enforce is a generation error
+    # rather than a silently unprotected field.
+    secured_permissions: Dict[str, str] = {}
+    secured_directive: str = "secured"
+    # Strawberry permissions run per resolved field, so a `@secured` on an input
+    # field, argument, or object type has no enforcement point. Listing such a
+    # location here accepts that those declarations stay unenforced.
+    secured_unenforced_locations: List[str] = []
     generate_enums: bool = True
     generate_types: bool = True
     generate_inputs: bool = True
@@ -387,6 +414,98 @@ class StrawberryPluginConfig(PluginConfig):
     generate_enums_func: StrawberryGenerateFunc = default_generate_enums
 
 
+def reference_scalar_annotation(
+    scalar_name: str,
+    config: GeneratorConfig,
+    plugin_config: StrawberryPluginConfig,
+    registry: ClassRegistry,
+):
+    """Resolve a GraphQL scalar to the annotation node used for it.
+
+    An explicit ``scalar_definitions`` entry always wins — a user who wrote
+    ``ID: str`` means it. Otherwise the plugin-level overrides apply, which keeps
+    a Strawberry schema's ``ID`` an ``ID`` instead of silently becoming
+    ``String`` (the shared scalar map defaults ``ID`` to ``str`` for the pydantic
+    plugins, which have no GraphQL ID type).
+    """
+    if scalar_name not in config.scalar_definitions:
+        override = plugin_config.scalar_overrides.get(scalar_name)
+
+        if override:
+            module, _, attribute = override.rpartition(".")
+
+            if module:
+                registry.register_import(module)
+                return ast.Attribute(
+                    value=ast.Name(id=module.split(".")[-1], ctx=ast.Load()),
+                    attr=attribute,
+                    ctx=ast.Load(),
+                )
+
+            return ast.Name(id=override, ctx=ast.Load())
+
+    return registry.reference_scalar(scalar_name)
+
+
+def generate_union_annotation(
+    graphql_type: GraphQLUnionType,
+    parent: str,
+    config: GeneratorConfig,
+    plugin_config: StrawberryPluginConfig,
+    registry: ClassRegistry,
+    recurse: Callable[..., ast.AST],
+):
+    """Build ``Annotated[Union[A, B], strawberry.union("NamedUnion")]``.
+
+    Without the ``Annotated`` metadata strawberry derives the union's name from
+    its members: ``union ClientDocument = Invoice | Receipt`` comes out as
+    ``ClientDocumentInvoiceReceipt``, which no longer matches the schema clients
+    generated their types against. Naming it explicitly keeps the served schema
+    identical to the SDL. Repeated construction of the same union name is safe —
+    strawberry deduplicates it.
+    """
+    registry.register_import("typing.Annotated")
+    registry.register_import("typing.Union")
+    registry.register_import("strawberry")
+
+    return ast.Subscript(
+        value=ast.Name("Annotated", ctx=ast.Load()),
+        slice=ast.Tuple(
+            elts=[
+                ast.Subscript(
+                    value=ast.Name("Union", ctx=ast.Load()),
+                    slice=ast.Tuple(
+                        elts=[
+                            recurse(
+                                union_type,
+                                parent,
+                                config,
+                                plugin_config,
+                                registry,
+                                is_optional=False,
+                            )
+                            for union_type in graphql_type.types
+                        ],
+                        ctx=ast.Load(),
+                    ),
+                    ctx=ast.Load(),
+                ),
+                ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name("strawberry", ctx=ast.Load()),
+                        attr="union",
+                        ctx=ast.Load(),
+                    ),
+                    args=[ast.Constant(value=graphql_type.name)],
+                    keywords=[],
+                ),
+            ],
+            ctx=ast.Load(),
+        ),
+        ctx=ast.Load(),
+    )
+
+
 def generate_object_field_annotation(
     graphql_type: GraphQLType,
     parent: str,
@@ -400,11 +519,15 @@ def generate_object_field_annotation(
             registry.register_import("typing.Optional")
             return ast.Subscript(
                 value=ast.Name("Optional", ctx=ast.Load()),
-                slice=registry.reference_scalar(graphql_type.name),
+                slice=reference_scalar_annotation(
+                    graphql_type.name, config, plugin_config, registry
+                ),
                 ctx=ast.Load(),
             )
 
-        return registry.reference_scalar(graphql_type.name)
+        return reference_scalar_annotation(
+            graphql_type.name, config, plugin_config, registry
+        )
 
     if isinstance(graphql_type, GraphQLInterfaceType):
         if is_optional:
@@ -428,50 +551,24 @@ def generate_object_field_annotation(
         return registry.reference_object(graphql_type.name, parent)
 
     if isinstance(graphql_type, GraphQLUnionType):
+        annotation = generate_union_annotation(
+            graphql_type,
+            parent,
+            config,
+            plugin_config,
+            registry,
+            generate_object_field_annotation,
+        )
+
         if is_optional:
             registry.register_import("typing.Optional")
-            registry.register_import("typing.Union")
             return ast.Subscript(
                 value=ast.Name("Optional", ctx=ast.Load()),
-                slice=ast.Subscript(
-                    value=ast.Name("Union", ctx=ast.Load()),
-                    slice=ast.Tuple(
-                        elts=[
-                            generate_object_field_annotation(
-                                union_type,
-                                parent,
-                                config,
-                                plugin_config,
-                                registry,
-                                is_optional=False,
-                            )
-                            for union_type in graphql_type.types
-                        ],
-                        ctx=ast.Load(),
-                    ),
-                ),
+                slice=annotation,
                 ctx=ast.Load(),
             )
-        registry.register_import("typing.Union")
 
-        return ast.Subscript(
-            value=ast.Name("Union", ctx=ast.Load()),
-            slice=ast.Tuple(
-                elts=[
-                    generate_object_field_annotation(
-                        union_type,
-                        parent,
-                        config,
-                        plugin_config,
-                        registry,
-                        is_optional=False,
-                    )
-                    for union_type in graphql_type.types
-                ],
-                ctx=ast.Load(),
-            ),
-            ctx=ast.Load(),
-        )
+        return annotation
 
     if isinstance(graphql_type, GraphQLEnumType):
         if is_optional:
@@ -554,11 +651,15 @@ def recurse_argument_annotation(
             registry.register_import("typing.Optional")
             return ast.Subscript(
                 value=ast.Name("Optional", ctx=ast.Load()),
-                slice=registry.reference_scalar(graphql_type.name),
+                slice=reference_scalar_annotation(
+                    graphql_type.name, config, plugin_config, registry
+                ),
                 ctx=ast.Load(),
             )
 
-        return registry.reference_scalar(graphql_type.name)
+        return reference_scalar_annotation(
+            graphql_type.name, config, plugin_config, registry
+        )
 
     if isinstance(graphql_type, GraphQLInputObjectType):
         if is_optional:
@@ -720,6 +821,131 @@ def generate_directive_keywords(
     return []
 
 
+SECURED_REQUIRES_ATTR = "requires"
+
+
+def secured_requires(
+    ast_node: Any, plugin_config: StrawberryPluginConfig
+) -> Optional[str]:
+    """Return the ``requires`` value of the configured secured directive.
+
+    ``None`` means the node does not carry the directive at all, which is the
+    common case and not an error.
+    """
+    directives = getattr(ast_node, "directives", None) or []
+    directive = next(
+        (d for d in directives if d.name.value == plugin_config.secured_directive),
+        None,
+    )
+
+    if directive is None:
+        return None
+
+    for argument in directive.arguments or []:
+        if argument.name.value == SECURED_REQUIRES_ATTR:
+            return argument.value.value
+
+    raise GenerationError(
+        f"@{plugin_config.secured_directive} is missing its "
+        f"`{SECURED_REQUIRES_ATTR}` argument, so its rule cannot be read."
+    )
+
+
+def ensure_secured_is_enforceable(
+    ast_node: Any, location: str, plugin_config: StrawberryPluginConfig
+) -> None:
+    """Refuse a secured directive that this plugin has no way to enforce.
+
+    Strawberry permissions run per resolved field, so a declaration on an input
+    field, an argument, or an object type has no enforcement point. Passing it
+    through would ship a field that advertises protection in the schema while
+    nothing checks it.
+    """
+    if not plugin_config.secured_permissions:
+        return
+
+    if secured_requires(ast_node, plugin_config) is None:
+        return
+
+    if location in plugin_config.secured_unenforced_locations:
+        return
+
+    raise GenerationError(
+        f"@{plugin_config.secured_directive} on {location} cannot be enforced by "
+        f"strawberry permissions. Remove the directive, or list {location!r} in "
+        f"`secured_unenforced_locations` to accept it staying unenforced."
+    )
+
+
+def generate_permission_keywords(
+    ast_node: Any, plugin_config: StrawberryPluginConfig, registry: ClassRegistry
+) -> List[ast.keyword]:
+    """Build ``extensions=[PermissionExtension(...)]`` for a mapped directive.
+
+    The configured value is a dotted path to a permission instance, resolved the
+    same way as every other user-code reference in turms (``scalar_definitions``,
+    ``additional_bases``): the module is imported and the final name is used.
+
+    Returns no keyword when the feature is unconfigured or the field carries no
+    secured directive, so an unconfigured plugin behaves exactly as before.
+    """
+    if not plugin_config.secured_permissions:
+        return []
+
+    requires = secured_requires(ast_node, plugin_config)
+
+    if requires is None:
+        return []
+
+    permission = plugin_config.secured_permissions.get(requires)
+
+    if permission is None:
+        raise GenerationError(
+            f"@{plugin_config.secured_directive}(requires: {requires!r}) has no "
+            f"entry in `secured_permissions`, so it cannot be enforced. Add a "
+            f"mapping for it, or remove the directive from the schema."
+        )
+
+    registry.register_import("strawberry.permission.PermissionExtension")
+    registry.register_import(permission)
+
+    return [
+        ast.keyword(
+            arg="extensions",
+            value=ast.List(
+                elts=[
+                    ast.Call(
+                        func=ast.Name(id="PermissionExtension", ctx=ast.Load()),
+                        keywords=[
+                            ast.keyword(
+                                arg="permissions",
+                                value=ast.List(
+                                    elts=[
+                                        ast.Name(
+                                            id=permission.split(".")[-1],
+                                            ctx=ast.Load(),
+                                        )
+                                    ],
+                                    ctx=ast.Load(),
+                                ),
+                            ),
+                            # The plugin emits the directive itself, so the
+                            # permission must not append a second copy to the
+                            # field.
+                            ast.keyword(
+                                arg="use_directives",
+                                value=ast.Constant(value=False),
+                            ),
+                        ],
+                        args=[],
+                    )
+                ],
+                ctx=ast.Load(),
+            ),
+        )
+    ]
+
+
 def generate_inputs(
     client_schema: GraphQLSchema,
     config: GeneratorConfig,
@@ -779,6 +1005,18 @@ def generate_inputs(
                         value=ast.Constant(value=value.deprecation_reason),
                     )
                 )
+
+            # Input fields cannot be guarded by a permission (there is nothing to
+            # resolve), so a configured plugin refuses rather than shipping the
+            # declaration unenforced.
+            ensure_secured_is_enforceable(
+                value.ast_node, "INPUT_FIELD_DEFINITION", plugin_config
+            )
+
+            # Input fields carry directives too (an authorization directive on a
+            # sensitive input field is the common case). Skipping them here made
+            # the generated schema silently drop the check, which fails open.
+            keywords += generate_directive_keywords(value.ast_node, plugin_config)
 
             # A caller may omit this field when it is nullable or carries a
             # schema default; either way the generated dataclass needs a
@@ -902,6 +1140,8 @@ def generate_types(
             object_type.ast_node, plugin_config
         )
 
+        ensure_secured_is_enforceable(object_type.ast_node, "OBJECT", plugin_config)
+
         if isinstance(object_type, GraphQLObjectType):
             classname = registry.generate_objecttype(key)
             decorator_name = "strawberry.type"
@@ -974,6 +1214,12 @@ def generate_types(
                 }
 
                 for argkey, arg in sorted_args.items():
+                    ensure_secured_is_enforceable(
+                        getattr(arg, "ast_node", None),
+                        "ARGUMENT_DEFINITION",
+                        plugin_config,
+                    )
+
                     additional_args.append(
                         ast.arg(
                             arg=registry.generate_parameter_name(argkey),
@@ -1008,6 +1254,9 @@ def generate_types(
             )
 
             keywords += generate_directive_keywords(value.ast_node, plugin_config)
+            keywords += generate_permission_keywords(
+                value.ast_node, plugin_config, registry
+            )
 
             if not additional_args and key not in ["Mutation", "Subscription", "Query"]:
                 if not keywords:
@@ -1206,7 +1455,7 @@ class StrawberryPlugin(Plugin):
 
         scalars = (
             generate_scalars(client_schema, config, self.config, registry)
-            if self.config.generate_directives
+            if self.config.generate_scalars
             else []
         )
 
